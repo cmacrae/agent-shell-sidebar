@@ -156,6 +156,19 @@ When nil, the sidebar can be resized manually and will be visible to
   :type 'boolean
   :group 'agent-shell-sidebar)
 
+(defcustom agent-shell-sidebar-use-custom-font t
+  "Show `agent-shell-sidebar' with custom font.
+
+This face can be customized using `agent-shell-sidebar-face'."
+  :type 'boolean
+  :group 'agent-shell-sidebar)
+
+(defface agent-shell-sidebar-face nil
+  "Face used by `agent-shell-sidebar' for custom font.
+
+This only takes effect if `agent-shell-sidebar-use-custom-font' is enabled."
+  :group 'agent-shell-sidebar)
+
 (defvar agent-shell-sidebar--project-state (make-hash-table :test 'equal)
   "Hash table storing sidebar state per project.
 Keys are project root paths, values are alists with:
@@ -316,7 +329,12 @@ CONFIG should be an agent config alist."
     (let ((shell-buffer (agent-shell--start :config config :no-focus t :new-session t)))
       (with-current-buffer shell-buffer
         (setq-local agent-shell-sidebar--is-sidebar t)
-        (add-hook 'kill-buffer-hook #'agent-shell-sidebar--clean-up nil t))
+        (add-hook 'kill-buffer-hook #'agent-shell-sidebar--clean-up nil t)
+
+        (when (and agent-shell-sidebar-use-custom-font
+                   (bound-and-true-p agent-shell-sidebar-face))
+          (setq-local buffer-face-mode-face agent-shell-sidebar-face)
+          (buffer-face-mode)))
 
       (map-put! state :buffer shell-buffer)
       (map-put! state :config config)

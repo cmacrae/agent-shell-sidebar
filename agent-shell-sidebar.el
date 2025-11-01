@@ -156,7 +156,7 @@ When nil, the sidebar can be resized manually and will be visible to
   :type 'boolean
   :group 'agent-shell-sidebar)
 
-(defcustom agent-shell-sidebar-use-custom-font t
+(defcustom agent-shell-sidebar-use-custom-font nil
   "Show `agent-shell-sidebar' with custom font.
 
 This face can be customized using `agent-shell-sidebar-face'."

@@ -328,15 +328,8 @@ CONFIG should be an agent config alist."
 If `agent-shell-sidebar-default-config' is set, use that without prompting.
 Otherwise, interactively prompt the user to select from `agent-shell-agent-configs'."
   (or agent-shell-sidebar-default-config
-      (let* ((configs agent-shell-agent-configs)
-             (choices (mapcar (lambda (config)
-                                (cons (or (map-elt config :mode-line-name)
-                                          (map-elt config :buffer-name)
-                                          "Unknown Agent")
-                                      config))
-                              configs))
-             (selected-name (completing-read "Select agent: " choices nil t)))
-        (map-elt choices selected-name))))
+      (agent-shell-select-config
+       :prompt "Select agent: ")))
 
 (cl-defun agent-shell-sidebar--save-last-window ()
   "Save the currently selected window before entering sidebar."

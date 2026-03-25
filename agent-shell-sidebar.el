@@ -145,14 +145,15 @@ The value should be an agent config alist as returned by
   :group 'agent-shell-sidebar)
 
 (defcustom agent-shell-sidebar-locked t
-  "When non-nil, lock the sidebar to its fixed position.
+  "When non-nil, lock the sidebar width to the configured value.
 
 A locked sidebar:
- * Cannot be resized manually
+ * Always uses the configured width (responsive to frame size changes)
  * Is invisible to `other-window' commands (C-x o)
 
-When nil, the sidebar can be resized manually and will be visible to
-`other-window' commands."
+When nil:
+ * Manual width changes are preserved across visibility toggles
+ * Sidebar participates in `other-window' cycling"
   :type 'boolean
   :group 'agent-shell-sidebar)
 
@@ -242,9 +243,15 @@ Returns an integer representing the final width in columns."
       buffer)))
 
 (cl-defun agent-shell-sidebar--get-window (&key (project-root (agent-shell-sidebar--get-project-root)))
-  "Get the window displaying the sidebar for PROJECT-ROOT."
-  (when-let* ((buffer (agent-shell-sidebar--get-buffer :project-root project-root)))
-    (get-buffer-window buffer)))
+  "Get the window displaying the sidebar for PROJECT-ROOT.
+Only returns windows that are actually sidebar windows, not normal windows
+showing the same buffer."
+  (when-let ((buffer (agent-shell-sidebar--get-buffer :project-root project-root)))
+    ;; Find the sidebar window among all windows showing this buffer
+    (seq-find (lambda (window)
+                (eq (window-parameter window 'window-side)
+                    agent-shell-sidebar-position))
+              (get-buffer-window-list buffer nil t))))
 
 (cl-defun agent-shell-sidebar--visible-p (&key (project-root (agent-shell-sidebar--get-project-root)))
   "Return t if sidebar for PROJECT-ROOT is currently visible."
@@ -263,9 +270,7 @@ Returns an integer representing the final width in columns."
       (set-window-parameter window 'window-side agent-shell-sidebar-position)
       (set-window-parameter window 'window-slot 0)
       (set-window-dedicated-p window t)
-
-      (with-current-buffer buffer
-        (setq-local window-size-fixed (when agent-shell-sidebar-locked 'width)))
+      (set-window-parameter window 'no-other-window agent-shell-sidebar-locked)
 
       (unless (one-window-p)
         (let* ((state (agent-shell-sidebar--project-state project-root))
@@ -282,17 +287,46 @@ Returns an integer representing the final width in columns."
             (enlarge-window-horizontally (- target-width (window-width)))))))))
 
 (cl-defun agent-shell-sidebar--display-buffer (&key buffer project-root)
-  "Display BUFFER as a sidebar for PROJECT-ROOT."
-  (let ((window (display-buffer
-                 buffer
-                 `(display-buffer-in-side-window
-                   . ((side . ,agent-shell-sidebar-position)
-                      (slot . 0)
-                      (window-width . ,(agent-shell-sidebar--calculate-width))
-                      (dedicated . t)
-                      (window-parameters . ((no-delete-other-windows . t))))))))
-    (agent-shell-sidebar--setup-window :buffer buffer :project-root project-root)
-    window))
+  "Display BUFFER as a sidebar for PROJECT-ROOT.
+If BUFFER is already visible in a non-sidebar window, closes that window first
+to avoid 'same side but no common parent' errors."
+  (let* ((existing-window (get-buffer-window buffer))
+         (existing-side (when existing-window
+                          (window-parameter existing-window 'window-side))))
+
+    ;; Handle existing window showing this buffer
+    (when existing-window
+      (cond
+       ;; Already a sidebar on the correct side - just return it
+       ((eq existing-side agent-shell-sidebar-position)
+        (agent-shell-sidebar--setup-window :buffer buffer :project-root project-root)
+        (cl-return-from agent-shell-sidebar--display-buffer existing-window))
+
+       ;; Normal window - need to remove buffer from it
+       (t
+        (if (one-window-p)
+            ;; If it's the only window, just switch it to most recent buffer first
+            (with-selected-window existing-window
+              (switch-to-buffer (other-buffer buffer)))
+          ;; Multiple windows - delete all non-sidebar windows showing this buffer
+          (dolist (win (get-buffer-window-list buffer nil t))
+            (unless (eq (window-parameter win 'window-side) agent-shell-sidebar-position)
+              (set-window-parameter win 'window-side nil)
+              (when (window-live-p win)
+                (delete-window win))))))))
+
+    ;; Create new sidebar window
+    (let ((window (display-buffer
+                   buffer
+                   `(display-buffer-in-side-window
+                     . ((side . ,agent-shell-sidebar-position)
+                        (slot . 0)
+                        (window-width . ,(agent-shell-sidebar--calculate-width))
+                        (dedicated . t)
+                        (window-parameters . ((no-delete-other-windows . t)
+                                              (no-other-window . ,agent-shell-sidebar-locked))))))))
+      (agent-shell-sidebar--setup-window :buffer buffer :project-root project-root)
+      window)))
 
 (defun agent-shell-sidebar--clean-up ()
   "Clean up sidebar resources when buffer is killed."
@@ -302,6 +336,20 @@ Returns an integer representing the final width in columns."
                   (buffer (map-elt state :buffer)))
         (when (eq buffer (current-buffer))
           (map-put! (agent-shell-sidebar--project-state project-root) :buffer nil))))))
+
+(defun agent-shell-sidebar--find-unregistered-buffers (project-root)
+  "Find existing agent-shell buffers for PROJECT-ROOT not registered with sidebar.
+Returns a list of unregistered agent-shell buffers that belong to PROJECT-ROOT."
+  (let ((unregistered-buffers '()))
+    (dolist (buffer (agent-shell-buffers))
+      (when (not (agent-shell-sidebar--buffer-p buffer))
+        ;; Check if this buffer belongs to the specified project root
+        (let ((buffer-project-root nil))
+          (with-current-buffer buffer
+            (setq buffer-project-root (agent-shell-sidebar--get-project-root)))
+          (when (equal buffer-project-root project-root)
+            (push buffer unregistered-buffers)))))
+    (nreverse unregistered-buffers)))
 
 (cl-defun agent-shell-sidebar--start-session (&key config project-root)
   "Start new agent-shell sidebar session using CONFIG in PROJECT-ROOT.
@@ -380,13 +428,32 @@ Otherwise, interactively prompt the user to select from `agent-shell-agent-confi
   (let ((window (agent-shell-sidebar--display-buffer :buffer buffer :project-root project-root)))
     (select-window window)))
 
+(cl-defun agent-shell-sidebar--adopt-existing-session (&key project-root)
+  "Adopt an existing agent-shell buffer as a sidebar session for PROJECT-ROOT.
+Searches for unregistered agent-shell buffers for the project, and if found,
+marks the first one as a sidebar buffer and registers it in the project state.
+Returns the adopted buffer, or nil if no unregistered buffers exist."
+  (when-let* ((unregistered-buffers (agent-shell-sidebar--find-unregistered-buffers project-root))
+              (buffer (car unregistered-buffers))
+              (state (agent-shell-sidebar--project-state project-root)))
+    (with-current-buffer buffer
+      (setq-local agent-shell-sidebar--is-sidebar t)
+      (add-hook 'kill-buffer-hook #'agent-shell-sidebar--clean-up nil t))
+    (map-put! state :buffer buffer)
+    ;; Don't set :config since the buffer has its own config
+    buffer))
+
 (cl-defun agent-shell-sidebar--create-and-show-sidebar (&key project-root)
-  "Create new sidebar for PROJECT-ROOT and show it."
+  "Create new sidebar for PROJECT-ROOT and show it.
+If an existing agent-shell buffer exists for this project that isn't
+registered with the sidebar, adopt it instead of creating a new session."
   (agent-shell-sidebar--save-last-window)
   (let* ((state (agent-shell-sidebar--project-state project-root))
-         (config (or (map-elt state :config)
-                     (agent-shell-sidebar--select-config)))
-         (shell-buffer (agent-shell-sidebar--start-session :config config :project-root project-root))
+         (shell-buffer (or (agent-shell-sidebar--adopt-existing-session :project-root project-root)
+                           ;; No existing buffer, create new session
+                           (let ((config (or (map-elt state :config)
+                                             (agent-shell-sidebar--select-config))))
+                             (agent-shell-sidebar--start-session :config config :project-root project-root))))
          (window (agent-shell-sidebar--display-buffer :buffer shell-buffer :project-root project-root)))
     (select-window window)))
 

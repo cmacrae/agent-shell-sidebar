@@ -4,8 +4,8 @@
 
 ;; Author: Calum MacRae https://github.com/cmacrae
 ;; URL: https://github.com/cmacrae/agent-shell-sidebar
-;; Package-Requires: ((emacs "29.1") (agent-shell "0.17.2"))
-;; Version: 0.1.0
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.63.4"))
+;; Version: 0.2.0
 
 ;; This package is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -41,12 +41,16 @@
 ;;   `agent-shell-sidebar-maximum-width'     - Maximum width (default: "50%")
 ;;   `agent-shell-sidebar-position'          - Position: 'left or 'right (default: 'right)
 ;;   `agent-shell-sidebar-default-config'    - Default config to use
+;;   `agent-shell-sidebar-session-strategy'  - Session strategy (default: 'new)
 ;;   `agent-shell-sidebar-locked'            - Lock sidebar position and size (default: t)
 ;;
 ;; Setting a default provider:
 ;;   To automatically use a specific provider without being prompted, set
-;;   `agent-shell-sidebar-default-config' to the result of calling one of
-;;   the agent-shell config functions:
+;;   `agent-shell-sidebar-default-config' to an agent identifier symbol or
+;;   the result of calling one of the agent-shell config functions:
+;;
+;;   ;; By identifier (simplest)
+;;   (setq agent-shell-sidebar-default-config 'claude-code)
 ;;
 ;;   ;; Anthropic's Claude Code
 ;;   (setq agent-shell-sidebar-default-config
@@ -63,6 +67,9 @@
 ;;   ;; Goose Agent
 ;;   (setq agent-shell-sidebar-default-config
 ;;         (agent-shell-goose-make-agent-config))
+;;
+;;   Alternatively, set `agent-shell-preferred-agent-config' globally; the
+;;   sidebar's config picker honors it as the default selection.
 
 ;;; Code:
 
@@ -72,10 +79,11 @@
 (require 'map)
 
 (declare-function project-root "project")
-(declare-function project-roots "project")
 (declare-function project-current "project")
 (declare-function projectile-project-root "projectile")
 (declare-function agent-shell--start "agent-shell")
+(declare-function agent-shell-select-config "agent-shell")
+(declare-function agent-shell--resolve-config-designator "agent-shell")
 
 (defgroup agent-shell-sidebar nil
   "Sidebar interface for agent-shell."
@@ -135,13 +143,30 @@ Valid values are:
   "Default agent config to use for sidebar sessions.
 
 When set, the sidebar will automatically use this config without prompting.
-When nil, the user will be prompted to select from `agent-shell-agent-configs'.
+When nil, the user will be prompted to select from `agent-shell-agent-configs'
+(via `agent-shell-select-config', which honors
+`agent-shell-preferred-agent-config' as the default selection).
 
-The value should be an agent config alist as returned by
-`agent-shell-make-agent-config' or provider-specific config functions like
+The value can be an agent identifier symbol (e.g., `claude-code') or an
+agent config alist as returned by `agent-shell-make-agent-config' or
+provider-specific config functions like
 `agent-shell-anthropic-make-claude-code-config'."
   :type '(choice (const :tag "Prompt for config" nil)
+                 (symbol :tag "Agent identifier")
                  (alist :tag "Agent config alist"))
+  :group 'agent-shell-sidebar)
+
+(defcustom agent-shell-sidebar-session-strategy 'new
+  "Session strategy to use for sidebar sessions.
+
+Applied buffer-locally via `agent-shell--start', overriding
+`agent-shell-session-strategy'.  Defaults to `new' so toggling the
+sidebar starts a fresh session without prompting.  Set to `latest' to
+resume the most recent session, or `prompt' to choose on each new
+sidebar session."
+  :type '(choice (const :tag "Always start new session" new)
+                 (const :tag "Load latest session" latest)
+                 (const :tag "Prompt for session" prompt))
   :group 'agent-shell-sidebar)
 
 (defcustom agent-shell-sidebar-locked t
@@ -186,9 +211,7 @@ Checks projectile first, then project.el, then default-directory."
         (ignore-errors (projectile-project-root)))
       (when (fboundp 'project-root)
         (when-let* ((proj (project-current)))
-          (if (fboundp 'project-root)
-              (project-root proj)
-            (car (project-roots proj)))))
+          (project-root proj)))
       default-directory))
 
 (defun agent-shell-sidebar--project-state (project-root)
@@ -313,7 +336,10 @@ CONFIG should be an agent config alist."
       (kill-buffer existing-buffer))
 
     ;; Call agent-shell--start directly with no-focus and new-session parameters
-    (let ((shell-buffer (agent-shell--start :config config :no-focus t :new-session t)))
+    (let ((shell-buffer (agent-shell--start :config config
+                                            :no-focus t
+                                            :new-session t
+                                            :session-strategy agent-shell-sidebar-session-strategy)))
       (with-current-buffer shell-buffer
         (setq-local agent-shell-sidebar--is-sidebar t)
         (add-hook 'kill-buffer-hook #'agent-shell-sidebar--clean-up nil t))
@@ -326,17 +352,13 @@ CONFIG should be an agent config alist."
 (defun agent-shell-sidebar--select-config ()
   "Select an agent config for the sidebar.
 If `agent-shell-sidebar-default-config' is set, use that without prompting.
-Otherwise, interactively prompt the user to select from `agent-shell-agent-configs'."
-  (or agent-shell-sidebar-default-config
-      (let* ((configs agent-shell-agent-configs)
-             (choices (mapcar (lambda (config)
-                                (cons (or (map-elt config :mode-line-name)
-                                          (map-elt config :buffer-name)
-                                          "Unknown Agent")
-                                      config))
-                              configs))
-             (selected-name (completing-read "Select agent: " choices nil t)))
-        (map-elt choices selected-name))))
+Otherwise, prompt via `agent-shell-select-config', which resolves
+`agent-shell-agent-configs' (including maker functions) and honors
+`agent-shell-preferred-agent-config'."
+  (if agent-shell-sidebar-default-config
+      (or (agent-shell--resolve-config-designator agent-shell-sidebar-default-config)
+          (error "No agent config found for: %s" agent-shell-sidebar-default-config))
+    (agent-shell-select-config :prompt "Select agent: ")))
 
 (cl-defun agent-shell-sidebar--save-last-window ()
   "Save the currently selected window before entering sidebar."
@@ -445,7 +467,7 @@ This will kill the current sidebar session and start a new one with
 the selected provider."
   (interactive)
   (let ((project-root (agent-shell-sidebar--get-project-root))
-        (config (agent-shell-sidebar--select-config)))
+        (config (agent-shell-select-config :prompt "Select agent: ")))
     (when-let* ((buffer (agent-shell-sidebar--get-buffer :project-root project-root)))
       (kill-buffer buffer))
     (agent-shell-sidebar--save-last-window)
